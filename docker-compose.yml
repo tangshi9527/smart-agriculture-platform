@@ -1,0 +1,150 @@
+version: "3.8"
+
+# 智慧农业云管端一体化平台 —— 全栈一键部署
+# 用法：
+#   docker compose up -d          # 启动全部（infra + 后端 + 前端）
+#   前端访问 http://localhost     # 后端 http://localhost:8080
+#
+# 说明：
+#   - 真实存储默认启用（InfluxDB 时序 + Redis 设备影子），已做健康检查
+#   - 设备模拟器建议在宿主机用 Python 脚本运行（见 README），容器内需 Python 时会回退内置 Java 模拟器
+#   - 所有凭据形如 ${VAR:-演示默认值}，把 .env.example 复制成 .env 即可覆盖
+
+services:
+  influxdb:
+    image: influxdb:2.7
+    container_name: agri-influxdb
+    ports:
+      - "8086:8086"
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: ${INFLUX_ADMIN_USER:-admin}
+      DOCKER_INFLUXDB_INIT_PASSWORD: ${INFLUX_ADMIN_PASSWORD:-admin123}
+      DOCKER_INFLUXDB_INIT_ORG: ${INFLUX_ORG:-smart-agri}
+      DOCKER_INFLUXDB_INIT_BUCKET: ${INFLUX_BUCKET:-agri-raw}
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUX_TOKEN:-my-super-token}
+    volumes:
+      - influx-data:/var/lib/influxdb2
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7
+    container_name: agri-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: agri-rabbitmq
+    ports:
+      - "5672:5672"   # AMQP
+      - "15672:15672" # 管理后台
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: agri-app
+    depends_on:
+      influxdb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      # 通过环境变量覆盖 application.yml，指向 compose 内服务名
+      INFLUX_URL: "http://influxdb:8086"
+      INFLUX_TOKEN: "${INFLUX_TOKEN:-my-super-token}"
+      # org / bucket 必须与上面 influxdb 的 init 值一致，否则后端连得上却写不进
+      INFLUX_ORG: "${INFLUX_ORG:-smart-agri}"
+      INFLUX_BUCKET: "${INFLUX_BUCKET:-agri-raw}"
+      INFLUX_DOWNSAMPLE_BUCKET: "${INFLUX_DOWNSAMPLE_BUCKET:-agri-1m}"
+      # 数据分层保留：raw 30 天 / 1m 365 天。改小之前要想清楚——
+      # 降采样 task 停摆 + raw retention 到期 = 数据永久丢失且无信号，
+      # 所以 rescue-retention 必须明显大于 task 的预计修复窗口
+      INFLUX_RAW_RETENTION_DAYS: "${INFLUX_RAW_RETENTION_DAYS:-30}"
+      INFLUX_DOWNSAMPLE_RETENTION_DAYS: "${INFLUX_DOWNSAMPLE_RETENTION_DAYS:-365}"
+      INFLUX_TASK_HEALTH_MS: "${INFLUX_TASK_HEALTH_MS:-300000}"
+      INFLUX_TASK_LAG_MS: "${INFLUX_TASK_LAG_MS:-600000}"
+      INFLUX_RESCUE_RETENTION_DAYS: "${INFLUX_RESCUE_RETENTION_DAYS:-365}"
+      REDIS_HOST: "redis"
+      MQTT_PORT: "1883"
+      # 模拟器服务账号（宿主机跑 device_sim.py 时也要用同一组）
+      MQTT_SIM_USERNAME: "${MQTT_SIM_USERNAME:-simulator}"
+      MQTT_SIM_SECRET: "${MQTT_SIM_SECRET:-sim-secret-2026-change-me}"
+      # JWT 签名密钥：不传会用 yml 里的演示串，公网部署必须覆盖
+      JWT_SECRET: "${JWT_SECRET:-smart-agriculture-cloud-platform-secret-key-2026-change-me-please}"
+      # 消息队列解耦（P2-1）：启用 RabbitMQ 真实解耦路径
+      MQ_ENABLED: "true"
+      SPRING_RABBITMQ_HOST: "rabbitmq"
+      SPRING_RABBITMQ_PORT: "5672"
+      SPRING_RABBITMQ_USERNAME: "${RABBITMQ_USERNAME:-guest}"
+      SPRING_RABBITMQ_PASSWORD: "${RABBITMQ_PASSWORD:-guest}"
+      # 持久化：启用 mysql profile，指向 compose 内 mysql 服务
+      SPRING_PROFILES_ACTIVE: "mysql"
+      SPRING_DATASOURCE_URL: "jdbc:mysql://mysql:3306/agri?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true&createDatabaseIfNotExist=true"
+      SPRING_DATASOURCE_USERNAME: "agri"
+      SPRING_DATASOURCE_PASSWORD: "${DB_PASSWORD:-agri123}"
+      # AI 告警解读（P3-1）：不传 api-key 就自动走本地规则模板，不影响启动
+      LLM_ENABLED: "${LLM_ENABLED:-false}"
+      LLM_API_KEY: "${LLM_API_KEY:-}"
+      LLM_BASE_URL: "${LLM_BASE_URL:-https://aigw-gzgy2.cucloud.cn:8443/v1}"
+      LLM_MODEL: "${LLM_MODEL:-DeepSeek-V4-Flash}"
+      LLM_AUTO_EXPLAIN: "${LLM_AUTO_EXPLAIN:-true}"
+      LLM_MIN_SEVERITY: "${LLM_MIN_SEVERITY:-CRITICAL}"
+      LLM_THROTTLE_SECONDS: "${LLM_THROTTLE_SECONDS:-60}"
+      LLM_STREAM_TIMEOUT_MS: "${LLM_STREAM_TIMEOUT_MS:-60000}"
+      # 时区：容器默认 UTC，告警与日志时间会与本地差 8 小时
+      TZ: "${TZ:-Asia/Shanghai}"
+    ports:
+      - "8080:8080"
+      - "1883:1883"
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: agri-frontend
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+
+  mysql:
+    image: mysql:8.0
+    container_name: agri-mysql
+    environment:
+      MYSQL_DATABASE: agri
+      MYSQL_USER: agri
+      MYSQL_PASSWORD: ${DB_PASSWORD:-agri123}
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-root123}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p$$MYSQL_ROOT_PASSWORD"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  influx-data:
+  mysql-data:
