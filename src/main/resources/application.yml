@@ -1,0 +1,169 @@
+server:
+  port: ${SERVER_PORT:8080}
+
+# —— 配置约定 ——
+# 所有可能涉及凭据的项都写成 ${环境变量:演示默认值}：
+#   · 不配环境变量 → 用下面的演示默认值，克隆下来就能跑（零配置起步）
+#   · 要改 → 复制 .env.example 为 .env（或直接设系统环境变量），不要改这个文件
+# 演示默认值仅用于本地开箱演示，任何公网/生产部署都必须覆盖。
+
+spring:
+  application:
+    name: smart-agriculture-platform
+  datasource:
+    url: jdbc:h2:file:${DB_PATH:./data/agri};DB_CLOSE_DELAY=-1;AUTO_SERVER=TRUE;MODE=MySQL
+    driver-class-name: org.h2.Driver
+    username: ${DB_USERNAME:sa}
+    password: ${DB_PASSWORD:}
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+    show-sql: false
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+  # —— 消息队列解耦（P2-1）RabbitMQ 连接配置（仅在 mq.enabled=true 时启用）——
+  rabbitmq:
+    host: ${RABBITMQ_HOST:localhost}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USERNAME:guest}
+    password: ${RABBITMQ_PASSWORD:guest}
+
+influx:
+  url: ${INFLUX_URL:http://localhost:8086}
+  # 演示 token，与 docker-compose 里 InfluxDB 初始化值一致
+  token: ${INFLUX_TOKEN:my-super-token}
+  org: ${INFLUX_ORG:smart-agri}
+  bucket: ${INFLUX_BUCKET:agri-raw}
+  downsample-bucket: ${INFLUX_DOWNSAMPLE_BUCKET:agri-1m}
+  # 数据生命周期：原始层 30 天、降采样层 365 天（0 = 永久）。只在建库时生效，改已有库需手动 update
+  raw-retention-days: ${INFLUX_RAW_RETENTION_DAYS:30}
+  downsample-retention-days: ${INFLUX_DOWNSAMPLE_RETENTION_DAYS:365}
+  # 降采样任务健康检查：task 是 InfluxDB 自己的调度对象，停摆时应用完全无感，
+  # 30 天后 raw retention 会把没降采样的数据删掉且没有任何信号 → 必须自己探
+  task-health-ms: ${INFLUX_TASK_HEALTH_MS:300000}          # 探测间隔，5 分钟
+  task-lag-threshold-ms: ${INFLUX_TASK_LAG_MS:600000}      # ds 落后 raw 超过 10 分钟判停摆（task 每 1 分钟跑，留 10 倍余量）
+  rescue-retention-days: ${INFLUX_RESCUE_RETENTION_DAYS:365}  # 停摆时把 raw retention 临时拉到这里止血
+  backfill-max-hours: ${INFLUX_BACKFILL_MAX_HOURS:72}      # 恢复后自动补算的最大跨度，超过只补最近一段
+
+redis:
+  host: ${REDIS_HOST:localhost}
+  port: ${REDIS_PORT:6379}
+  password: ${REDIS_PASSWORD:}
+  timeout: 3000ms
+  lettuce:
+    pool:
+      max-active: 16
+      max-idle: 8
+      min-idle: 2
+
+mqtt:
+  port: ${MQTT_PORT:1883}
+  auth:
+    enabled: true
+    # 模拟器专用「服务账号」：脚本连接统一使用此用户名/密码一次性放行
+    simulator-username: ${MQTT_SIM_USERNAME:simulator}
+    simulator-secret: ${MQTT_SIM_SECRET:sim-secret-2026-change-me}
+
+# —— 消息队列解耦（P2-1）——
+# 接入层 -> 消息总线 -> 三个下游消费者（持久化 / 告警 / 实时推送）解耦。
+# enabled=false（默认）：进程内本地总线，无需消息中间件，服务零外部依赖即可启动；
+# enabled=true：切换到 RabbitMQ 真实解耦（需 RabbitMQ 可达，docker-compose 已内置）。
+mq:
+  enabled: ${MQ_ENABLED:false}
+
+# 设备模拟器（独立 Python 脚本，由后端按需拉起）
+simulator:
+  python: ${SIMULATOR_PYTHON:python}
+  script: "simulator/device_sim.py"
+  broker-host: ${SIMULATOR_BROKER_HOST:127.0.0.1}
+  broker-port: ${SIMULATOR_BROKER_PORT:1883}
+
+jwt:
+  # 演示用密钥，长度满足 HS256 要求；生产请用 ≥32 字节随机串覆盖
+  secret: ${JWT_SECRET:smart-agriculture-cloud-platform-secret-key-2026-change-me-please}
+  expiration-ms: ${JWT_EXPIRATION_MS:86400000}
+
+# —— 可观测性（P1-1a）：暴露健康检查 / 指标 / Prometheus 抓取端点 ——
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+  metrics:
+    tags:
+      application: ${spring.application.name}
+
+# —— API 治理：下游熔断（P2-2）——
+# 对 TelemetryController 的 InfluxDB 查询做熔断保护：连续失败达阈值后打开熔断，
+# 在 wait-duration 内直接走降级 fallback，避免下游故障雪崩。
+resilience4j:
+  circuitbreaker:
+    instances:
+      telemetry:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 10
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 30s
+        permitted-number-of-calls-in-half-open-state: 3
+        automatic-transition-from-open-to-half-open: true
+      # —— 大模型调用熔断（P3-1）——
+      # LLM 网关在高峰期会限流/超时，熔断打开后直接走本地规则模板，避免每条告警都去撞墙。
+      llm:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 10
+        failure-rate-threshold: 60
+        wait-duration-in-open-state: 60s
+        permitted-number-of-calls-in-half-open-state: 2
+        automatic-transition-from-open-to-half-open: true
+        slow-call-duration-threshold: 20s
+        slow-call-rate-threshold: 80
+    metrics:
+      enabled: true
+
+# —— 资源守卫（演示态保护，P5）——
+# 这个项目的"降级"第一动机不是依赖故障，而是本机 CPU 顶不住（IDE + 浏览器 + 录屏常驻）。
+# 因此恢复要双条件：连接通 AND 资源允许；资源紧张时给的是"节流建议"（降采样率）而不是切内存。
+capacity:
+  # 演示态建议 0.5；生产态 0.8
+  cpu-threshold: ${CAPACITY_CPU_THRESHOLD:0.7}
+  heap-threshold: ${CAPACITY_HEAP_THRESHOLD:0.8}
+  sample-ms: ${CAPACITY_SAMPLE_MS:5000}
+
+# —— AI 告警解读（P3-1）——
+# 兼容 OpenAI 协议的推理网关，换供应商只改 base-url 与 model。
+# 未配置 api-key 时不会发起任何外部请求，自动降级为本地规则模板（大屏标注 LOCAL）。
+llm:
+  enabled: ${LLM_ENABLED:false}
+  base-url: ${LLM_BASE_URL:https://aigw-gzgy2.cucloud.cn:8443/v1}
+  api-key: ${LLM_API_KEY:}
+  model: ${LLM_MODEL:DeepSeek-V4-Flash}
+  max-tokens: ${LLM_MAX_TOKENS:512}
+  temperature: ${LLM_TEMPERATURE:0.3}
+  connect-timeout-ms: ${LLM_CONNECT_TIMEOUT_MS:5000}
+  # 流式总时长上限：网关不返回 [DONE] 却一直发心跳时，用它把线程收回来
+  stream-timeout-ms: ${LLM_STREAM_TIMEOUT_MS:60000}
+  explain:
+    auto: ${LLM_AUTO_EXPLAIN:true}
+    # 只自动解读该级别及以上的告警：INFO / WARN / CRITICAL
+    min-severity: ${LLM_MIN_SEVERITY:CRITICAL}
+    # 同设备同规则的最小解读间隔（秒），防告警风暴烧 token
+    throttle-seconds: ${LLM_THROTTLE_SECONDS:60}
+    persist: ${LLM_PERSIST:true}
+
+# —— API 治理：版本兼容开关（P2-2）——
+# 开启时 /api/** 与 /api/v1/** 同时可用（向后兼容）；下线旧版时置为 false。
+api:
+  version:
+    legacy-compat: ${API_LEGACY_COMPAT:true}
+
+logging:
+  level:
+    root: INFO
+    com.smartagri: INFO
+    io.netty: WARN

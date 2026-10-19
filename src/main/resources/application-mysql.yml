@@ -1,0 +1,14 @@
+# 生产 profile：MySQL 持久化（默认 dev 用文件型 H2，重启不丢）
+# 启用：java -jar app.jar --spring.profiles.active=mysql
+# 凭据一律走环境变量，下面的默认值仅用于本地演示，生产必须覆盖。
+spring:
+  datasource:
+    url: jdbc:mysql://${DB_HOST:localhost}:${DB_PORT:3306}/${DB_NAME:agri}?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true&createDatabaseIfNotExist=true
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    username: ${DB_USERNAME:agri}
+    password: ${DB_PASSWORD:agri123}
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+    show-sql: false

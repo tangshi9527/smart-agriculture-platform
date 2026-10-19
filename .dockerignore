@@ -1,0 +1,7 @@
+target/
+.git/
+*.log
+simulator/.venv/
+simulator/__pycache__/
+.idea/
+*.iml

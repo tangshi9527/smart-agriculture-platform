@@ -1,0 +1,43 @@
+# ---------- 构建产物 ----------
+target/
+*.class
+*.jar
+
+# ---------- 前端 ----------
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+npm-debug.log*
+
+# ---------- 本地运行数据 ----------
+data/
+*.db
+*.mv.db
+*.trace.db
+*.hprof
+
+# ---------- 日志与临时输出 ----------
+*.log
+*.err
+*.out
+
+# ---------- Python（设备模拟器）----------
+simulator/__pycache__/
+__pycache__/
+*.py[cod]
+simulator/.venv/
+.venv/
+
+# ---------- 环境变量与密钥 ----------
+# .env.example 是模板，要提交；.env 是真实值，绝不提交
+.env
+.env.*
+!.env.example
+
+# ---------- IDE / 系统垃圾 ----------
+.idea/
+*.iml
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
