@@ -67,6 +67,9 @@ public class SystemController {
         influxInfo.put("why", influx.degradeReason());
         influxInfo.put("autoRecoverAt", influx.nextProbeAt());
         influxInfo.put("backoffAttempts", influx.recoverAttempts());
+        // 落库通道的四种"丢"分开给：队列满丢（写入跟不上）/ 服务端拒绝（数据有问题）/
+        // 非法字段剔除（传感器坏了）/ 内存淘汰（降级太久）。合成一个数会让运维照错方向查。
+        influxInfo.put("write", influx.writeStats());
         // 降采样任务健康：retention 把 raw 压到 30 天之后，"task 停摆"就成了一条静默丢数据的路径，
         // 必须单独给结论（healthy / lastTaskSuccessAt / retentionRescued / gaps）
         influxInfo.put("downsample", influx.downsampleHealth());

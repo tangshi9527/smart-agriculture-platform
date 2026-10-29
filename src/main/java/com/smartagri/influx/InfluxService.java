@@ -7,6 +7,7 @@ import com.influxdb.client.domain.Organization;
 import com.influxdb.client.domain.Task;
 import com.influxdb.client.domain.WritePrecision;
 import com.influxdb.client.write.Point;
+import com.influxdb.exceptions.InfluxException;
 import com.influxdb.query.FluxRecord;
 import com.influxdb.query.FluxTable;
 import com.smartagri.device.Telemetry;
@@ -17,6 +18,7 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -72,6 +74,50 @@ public class InfluxService {
 
     private WriteApiBlocking writeApi;
     private volatile boolean influxAvailable = false;
+
+    // ===== 落库攒批（P0-1） =====
+    /** 批量写入器；init() 成功后才创建，单测直接 new 时为 null（走同步写老路径） */
+    private InfluxBatchWriter batchWriter;
+
+    /** 攒批参数：字段带默认值，是为了单测 {@code new InfluxService(mock)} 不走 Spring 注入时也有合理值 */
+    @Value("${influx.write.batch-size:500}")
+    private int writeBatchSize = 500;
+    @Value("${influx.write.flush-interval-ms:200}")
+    private long writeFlushIntervalMs = 200;
+    @Value("${influx.write.queue-capacity:20000}")
+    private int writeQueueCapacity = 20000;
+
+    /**
+     * 连续失败多少批才整体降级。
+     *
+     * <p>取 3 而不是 1：网络超时、连接池短暂耗尽、服务端一次 GC 停顿都会让单次写入失败，
+     * 一失败就切内存会把全平台拖进降级态（几百台设备的查询立刻全部走内存），
+     * 而对手很可能第 2 秒就恢复了。连续 3 批（默认约 600ms 内）都失败才算真的不通。</p>
+     */
+    @Value("${influx.write.fail-threshold:3}")
+    private int writeFailThreshold = 3;
+
+    /** 连续写入失败批次数；成功一批即归零 */
+    private final java.util.concurrent.atomic.AtomicInteger consecutiveWriteFailures =
+            new java.util.concurrent.atomic.AtomicInteger(0);
+    /**
+     * 被服务端明确拒绝、按「不可重试」丢弃的点数。
+     *
+     * <p>这类丢弃和降级淘汰不是一回事：这些点是<b>数据本身有问题</b>（字段类型冲突、
+     * 行协议语法错、token 无权限），补写一万次也是同样结果。它们必须和"丢了多少点"
+     * 分开暴露，否则运维会去查网络，而真正该改的是上报字段。</p>
+     */
+    private final java.util.concurrent.atomic.AtomicLong rejectedPoints = new java.util.concurrent.atomic.AtomicLong(0);
+    /**
+     * 因字段值为 NaN / ±Infinity 而被剔除的字段数。
+     *
+     * <p>单独计数而不是并进 {@link #rejectedPoints}：这两个数指向完全不同的排查方向。
+     * 前者说明<b>传感器在吐非法值</b>（该查设备或接入层清洗），后者说明<b>写入被服务端拒绝</b>
+     * （该查字段类型冲突或权限）。混在一起就等于没数。</p>
+     */
+    private final java.util.concurrent.atomic.AtomicLong invalidFields = new java.util.concurrent.atomic.AtomicLong(0);
+    /** 写锁：攒批线程与降级补写线程都会碰 writeApi，串行化避免行协议批次交叉 */
+    private final Object writeLock = new Object();
 
     /** 内存降级存储：device -> 该设备原始采样点（有界，防止长跑 OOM） */
     private static final int MAX_MEM_POINTS_PER_DEVICE = 3000;
@@ -165,12 +211,25 @@ public class InfluxService {
             ensureBucket(rawBucket);
             ensureBucket(dsBucket);
             ensureDownsampleTask();
+            // 攒批线程只在初始化成功后拉起：连不上 Influx 时它没有意义，
+            // 而且此时写必然失败，只会把队列灌满再丢掉
+            batchWriter = new InfluxBatchWriter(writeQueueCapacity, writeBatchSize,
+                    writeFlushIntervalMs, this::sinkWriteBatch);
             influxAvailable = true;
-            log.info("InfluxDB 初始化完成: raw={}, downsample={}", rawBucket, dsBucket);
+            log.info("InfluxDB 初始化完成: raw={}, downsample={}；落库攒批 batchSize={} flushInterval={}ms",
+                    rawBucket, dsBucket, writeBatchSize, writeFlushIntervalMs);
         } catch (Exception e) {
             influxAvailable = false;
             enterDegraded("startup-probe-failed");
             log.warn("InfluxDB 不可用，已降级为内存时序存储（请确认 InfluxDB 已启动且 token 有权限）: {}", e.getMessage());
+        }
+    }
+
+    /** 停机时把攒批队列里剩下的点写完，避免正常重启丢掉最后几百条 */
+    @PreDestroy
+    public void shutdown() {
+        if (batchWriter != null) {
+            batchWriter.shutdown();
         }
     }
 
@@ -186,6 +245,11 @@ public class InfluxService {
     @Scheduled(fixedDelayString = "${influx.recover-tick-ms:5000}")
     public void probeInflux() {
         if (influxAvailable) {
+            // 正常态也要做一件事：把「写入抖动时临时收进内存」的点补写回去。
+            // 不加这一步的话，一次未达降级阈值的失败（1~2 批）会把那几百个点永久卡在
+            // 内存里——因为恢复探测只在 influxAvailable=false 时才跑，而它根本没降级。
+            // 表现是：曲线在 T 那一刻缺一块，health 全绿，没人知道为什么。
+            flushPendingBacklog();
             return;
         }
         long now = System.currentTimeMillis();
@@ -243,7 +307,30 @@ public class InfluxService {
      * @return 成功写回的条数；写失败会抛异常，由调用方保持降级状态（内存数据不清空，下一轮重试）
      */
     private int flushMemoryBacklog() {
-        return flushMemoryBacklog(writeApi);
+        synchronized (writeLock) {
+            return flushMemoryBacklog(writeApi);
+        }
+    }
+
+    /**
+     * 正常态下的补写：把写入抖动期间临时收进内存的点补回 Influx。
+     *
+     * <p>只在 {@code memRaw} 非空时才真正动作，因此稳态下每次 5 秒的 tick 只是一次
+     * {@code isEmpty()} 判断，不产生任何网络请求。</p>
+     */
+    private void flushPendingBacklog() {
+        if (memRaw.isEmpty() || writeApi == null) {
+            return;
+        }
+        try {
+            int n = flushMemoryBacklog();
+            if (n > 0) {
+                log.info("补写抖动期间暂存的 {} 个点（未触发降级）", n);
+            }
+        } catch (Exception e) {
+            // 还是不通：留在内存里等下一个 tick，不影响正常写入
+            log.debug("暂存点补写失败，下个周期重试: {}", e.getMessage());
+        }
     }
 
     /** 包可见重载：便于单测直接验证补写逻辑，不必起真实 InfluxDB */
@@ -347,6 +434,67 @@ public class InfluxService {
     /** 累计因内存有界淘汰永久丢失的点数 */
     public long evictedPoints() {
         return evictedCounter.get();
+    }
+
+    /**
+     * 落库通道的观测数据。
+     *
+     * <p>四个「丢」必须分开给，因为它们对应四种完全不同的处置：
+     * 队列满丢（写入跟不上，该加线程/减负载）、服务端拒绝（数据本身有问题，该改上报字段）、
+     * 非法字段剔除（传感器坏了，该查设备）、内存淘汰（降级太久，该修 Influx）。
+     * 合成一个 {@code dropped} 会让运维照着错的怀疑方向去排查。</p>
+     */
+    public Map<String, Object> writeStats() {
+        Map<String, Object> m = new LinkedHashMap<>();
+        InfluxBatchWriter w = batchWriter;
+        m.put("mode", w == null ? "sync" : "batched");
+        m.put("batchSize", writeBatchSize);
+        m.put("flushIntervalMs", writeFlushIntervalMs);
+        if (w != null) {
+            m.put("accepted", w.acceptedCount());
+            m.put("written", w.writtenCount());
+            m.put("pending", w.pending());
+            // 队列满而丢：写入速度跟不上上报速度（Influx 变慢或攒批线程被拖住）
+            m.put("droppedQueueFull", w.droppedCount());
+            m.put("failedBatches", w.failedBatches());
+        }
+        m.put("rejectedByServer", rejectedPoints.get());
+        m.put("invalidFieldsSkipped", invalidFields.get());
+        m.put("evictedFromMemory", evictedCounter.get());
+        m.put("memoryPendingPoints", memoryPointCount());
+        m.put("consecutiveFailures", consecutiveWriteFailures.get());
+        m.put("degradeThreshold", writeFailThreshold);
+        return m;
+    }
+
+    /** 内存降级缓冲里现有的点数（health 与单测共用） */
+    public int memoryPointCount() {
+        int n = 0;
+        for (List<Rec> l : memRaw.values()) {
+            synchronized (l) {
+                n += l.size();
+            }
+        }
+        return n;
+    }
+
+    // ===================== 单测钩子 =====================
+    // 这几个方法只给单测用：验证"一批遥测怎么落库、失败算不算降级"不需要起真实 InfluxDB，
+    // 而 init() 又必须先连上服务端才能跑。生产路径不会调用它们。
+
+    /** 包可见：手动置位可用状态，模拟"已经连上 Influx" */
+    void setInfluxAvailableForTest(boolean available) {
+        this.influxAvailable = available;
+    }
+
+    /** 包可见：注入 mock 的写入通道 */
+    void setWriteApiForTest(WriteApiBlocking api) {
+        this.writeApi = api;
+    }
+
+    /** 包可见：直接喂一批遥测走落库与错误分类逻辑 */
+    boolean writeBatchForTest(List<Telemetry> batch) {
+        return sinkWriteBatch(batch);
     }
 
     // ===================== 降采样任务健康检查 =====================
@@ -692,27 +840,144 @@ public class InfluxService {
         log.info("已创建降采样任务: {}", taskName);
     }
 
-    /** 写入一条遥测（异步提交由调用方负责；此处同步写入） */
+    /**
+     * 写入一条遥测。
+     *
+     * <p>正常态：只入攒批队列就返回，<b>调用方不等网络</b>。队列满则丢弃计数，不阻塞——
+     * 阻塞的调用方是 storage 消费者线程，堵它会顺着有界队列一路反压到接入层。
+     * 降级态：直接落内存缓冲，等恢复后补写。</p>
+     */
     public void write(Telemetry t) {
         if (influxAvailable) {
-            try {
-                Point point = Point.measurement("telemetry")
-                        .addTag("device", t.getDeviceId())
-                        .time(Instant.ofEpochMilli(t.getTs()), WritePrecision.MS);
-                for (Map.Entry<String, Double> e : t.getMetrics().entrySet()) {
-                    point.addField(e.getKey(), e.getValue());
-                }
-                writeApi.writePoint(rawBucket, org, point);
-                return;
-            } catch (Exception e) {
-                log.warn("写入 InfluxDB 失败，切换为内存降级: {}", e.getMessage());
-                influxAvailable = false;
-                enterDegraded("write-failed");
+            if (batchWriter != null) {
+                batchWriter.offer(t);
+            } else {
+                // init 没走过（单测直接 new）或已停机：同步写，保持旧行为
+                writeNow(t);
+            }
+            return;
+        }
+        stashToMemory(t);
+    }
+
+    /** 不经攒批的同步单点写；只在攒批器不可用时兜底 */
+    private void writeNow(Telemetry t) {
+        try {
+            synchronized (writeLock) {
+                writeApi.writePoints(rawBucket, org, List.of(toPoint(t)));
+            }
+            consecutiveWriteFailures.set(0);
+        } catch (Exception e) {
+            onTransportFailure(List.of(t), e);
+        }
+    }
+
+    /**
+     * 攒批器的落库回调：由后台单线程调用，一次处理一批遥测。
+     *
+     * <p><b>这里的错误分类是整个降级逻辑的关键。</b>上一版是
+     * {@code catch (Exception e) → influxAvailable = false}，把「网络不通」和
+     * 「这条数据服务端不要」当成同一件事。后果有两个：</p>
+     * <ol>
+     *   <li>网络抖一次，几百台设备全部切进内存，哪怕第二秒就恢复了；</li>
+     *   <li>字段类型冲突这类 HTTP 400 会让系统<b>永久</b>留在降级态——重试永远是 400，
+     *       于是正常数据也开始往内存里堆，最终再次 OOM。</li>
+     * </ol>
+     */
+    private boolean sinkWriteBatch(List<Telemetry> batch) {
+        if (!influxAvailable) {
+            batch.forEach(this::stashToMemory);
+            return true;
+        }
+        List<Point> points = new ArrayList<>(batch.size());
+        for (Telemetry t : batch) {
+            Point p = toPoint(t);
+            // 没有任何有效字段的点写进去必被服务端拒（400），而攒批之后一条脏数据
+            // 会连累另外几百条好数据一起被退回——批量把单点故障放大了 500 倍，
+            // 所以必须在组批阶段就把空点剔掉。
+            if (p != null) {
+                points.add(p);
             }
         }
-        // 内存降级写入
+        if (points.isEmpty()) {
+            return true;
+        }
+        try {
+            synchronized (writeLock) {
+                writeApi.writePoints(rawBucket, org, points);
+            }
+            consecutiveWriteFailures.set(0);
+            return true;
+        } catch (InfluxException e) {
+            int status = e.status();
+            // 4xx = 请求或数据本身有问题。408（超时）与 429（限流）属于「过会儿再来」，
+            // 不算不可重试；其余 4xx（400 行协议/字段类型、401、413 过大）重试结果一样。
+            if (status >= 400 && status < 500 && status != 408 && status != 429) {
+                rejectedPoints.addAndGet(points.size());
+                log.warn("InfluxDB 拒绝写入（HTTP {}），{} 个点按不可重试丢弃，不触发降级。"
+                                + "先查上报字段类型是否与前序数据冲突: {}",
+                        status, points.size(), e.getMessage());
+                return true;
+            }
+            return onTransportFailure(batch, e);
+        } catch (Exception e) {
+            return onTransportFailure(batch, e);
+        }
+    }
+
+    /**
+     * 传输层失败：数据先转进内存不丢，<b>连续失败到阈值才整体降级</b>。
+     *
+     * @return 恒为 false，表示这批没写成功
+     */
+    private boolean onTransportFailure(List<Telemetry> batch, Exception e) {
+        batch.forEach(this::stashToMemory);
+        int fails = consecutiveWriteFailures.incrementAndGet();
+        if (fails >= Math.max(1, writeFailThreshold)) {
+            boolean wasAvailable = influxAvailable;
+            influxAvailable = false;
+            enterDegraded("write-failed");
+            if (wasAvailable) {
+                log.warn("InfluxDB 连续 {} 批写入失败，切换为内存降级（数据已转内存，恢复后补写）: {}",
+                        fails, e.getMessage());
+            }
+        } else {
+            log.debug("InfluxDB 写入失败（第 {}/{} 次，未达降级阈值），本批 {} 条已转内存待补写: {}",
+                    fails, Math.max(1, writeFailThreshold), batch.size(), e.getMessage());
+        }
+        return false;
+    }
+
+    /** 遥测 → 写入点；字段全部无效时返回 null（调用方据此跳过） */
+    private Point toPoint(Telemetry t) {
+        Point point = Point.measurement("telemetry")
+                .addTag("device", t.getDeviceId())
+                .time(Instant.ofEpochMilli(t.getTs()), WritePrecision.MS);
+        int valid = 0;
+        for (Map.Entry<String, Double> e : t.getMetrics().entrySet()) {
+            double v = e.getValue() == null ? Double.NaN : e.getValue();
+            // NaN / ±Infinity 在行协议里是非法的，服务端整批 400。
+            // 这里逐字段剔除，让一条坏读数只丢它自己，不连累同批的几百条。
+            if (!Double.isFinite(v)) {
+                invalidFields.incrementAndGet();
+                continue;
+            }
+            point.addField(e.getKey(), v);
+            valid++;
+        }
+        return valid == 0 ? null : point;
+    }
+
+    /** 落进内存降级缓冲（每设备有界淘汰）；写入失败与整体降级共用这一条路 */
+    private void stashToMemory(Telemetry t) {
+        if (t == null || t.getMetrics() == null) {
+            return;
+        }
         List<Rec> list = memRaw.computeIfAbsent(t.getDeviceId(), k -> Collections.synchronizedList(new ArrayList<>()));
         for (Map.Entry<String, Double> e : t.getMetrics().entrySet()) {
+            if (e.getValue() == null || !Double.isFinite(e.getValue())) {
+                continue;
+            }
             list.add(new Rec(t.getDeviceId(), t.getTs(), e.getKey(), e.getValue()));
         }
         // 有界淘汰：仅保留每设备最近 MAX_MEM_POINTS_PER_DEVICE 个点，避免 1000 设备长跑时无限堆积导致 OOM

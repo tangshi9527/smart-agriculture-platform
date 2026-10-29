@@ -4,13 +4,14 @@ import org.junit.jupiter.api.Test;
 import org.springframework.data.redis.core.HashOperations;
 import org.springframework.data.redis.core.SetOperations;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.ZSetOperations;
 
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyMap;
+import static org.mockito.ArgumentMatchers.anySet;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doReturn;
@@ -50,10 +51,14 @@ class DeviceShadowRecoveryTest {
 
         // Redis 恢复
         HashOperations<String, Object, Object> hash = mock(HashOperations.class);
+        ZSetOperations<String, String> zset = mock(ZSetOperations.class);
+        // 设备全集（agri:devices）仍是普通 SET，回写时也要有对应的 mock，
+        // 否则 opsForSet() 返回 null，回写过程 NPE 会被当成"Redis 仍不可用"
         SetOperations<String, String> set = mock(SetOperations.class);
         // 用 doReturn 而不是 when(...)：此时 opsForHash() 仍处于抛异常状态，
         // when() 会把异常带出来，doReturn 不会真正调用方法
         doReturn(hash).when(redis).opsForHash();
+        doReturn(zset).when(redis).opsForZSet();
         doReturn(set).when(redis).opsForSet();
         when(redis.hasKey(anyString())).thenReturn(true);
 
@@ -62,7 +67,9 @@ class DeviceShadowRecoveryTest {
         assertTrue(svc.isRedisAvailable(), "探测成功后必须切回 Redis，否则就是单向门");
         // 降级期间的内存状态必须回写，否则切回瞬间数据断层
         verify(hash).putAll(eq("agri:shadow:dev-1"), anyMap());
-        verify(set).add(eq("agri:online"), any(String[].class));
+        // 在线集合是 ZSET（score=心跳时间）：回写时既要恢复成员，也要刷新 score，
+        // 否则刚切回就会被离线扫描判成超时
+        verify(zset).add(eq("agri:online"), anySet());
     }
 
     @Test
