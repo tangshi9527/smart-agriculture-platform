@@ -6,6 +6,7 @@
 import json
 import re
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ORG = {"id": "org-1", "name": "smart-agri", "status": "active"}
@@ -22,7 +23,10 @@ TASK = {"id": "t-1", "orgID": "org-1", "name": "agri-downsample-1m", "status": "
 
 lock = threading.Lock()
 # 运行时可通过 /_mode?m=ok|err400|err500 切换写入行为，用来验证客户端的错误分类
-mode = {"write": "ok"}
+# d=<毫秒> 给每次写入注入固定处理耗时，模拟真实 InfluxDB 解析行协议的开销。
+# 这个假服务本身只做正则统计，往返接近 0.3ms，不注入延迟的话「逐条写」会显得异常地快，
+# 得出的结论会被这个假象带偏。
+mode = {"write": "ok", "delay_ms": 0}
 stats = {"write_calls": 0, "points_total": 0, "batch_sizes": [], "devices": set()}
 
 
@@ -47,8 +51,17 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/_mode":
             from urllib.parse import parse_qs
             q = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
-            new = q.get("m", ["ok"])[0]
-            mode["write"] = new
+            if "m" in q:
+                mode["write"] = q["m"][0]
+            if "d" in q:
+                mode["delay_ms"] = int(q["d"][0])
+            # d=0 同时把已累计的统计清零，方便每组实验从零开始
+            if "reset" in q:
+                with lock:
+                    stats["write_calls"] = 0
+                    stats["points_total"] = 0
+                    stats["batch_sizes"].clear()
+                    stats["devices"].clear()
             return self._send(200, json.dumps(mode))
         if p == "/_stats":
             with lock:
@@ -85,6 +98,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400, json.dumps({"code": "invalid",
                                                    "message": "partial write: field type conflict"}))
             lines = [l for l in body.decode("utf-8", "ignore").split("\n") if l.strip()]
+            # 模拟服务端解析开销：放在统计之前，让「等待」发生在响应返回之前
+            if mode["delay_ms"] > 0:
+                time.sleep(mode["delay_ms"] / 1000.0)
             devices = set()
             for l in lines:
                 m = re.search(r"device=([^ ,]+)", l)
