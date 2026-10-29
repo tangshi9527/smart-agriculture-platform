@@ -144,7 +144,20 @@ class StatsHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+class QuietServer(ThreadingHTTPServer):
+    """压满基准时客户端会大量主动断开 keep-alive 连接，默认实现会把
+    每个 ConnectionResetError 的栈都打出来（实测 12 分钟刷了 36KB stderr）。
+    客户端先走是正常现象，不是服务端的问题，这里静默掉。"""
+
+    def handle_error(self, request, client_address):
+        import sys
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError)):
+            return
+        super().handle_error(request, client_address)
+
+
 if __name__ == "__main__":
     import sys
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8086
-    ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    QuietServer(("127.0.0.1", port), Handler).serve_forever()
