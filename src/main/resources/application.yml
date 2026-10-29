@@ -47,6 +47,18 @@ influx:
   task-lag-threshold-ms: ${INFLUX_TASK_LAG_MS:600000}      # ds 落后 raw 超过 10 分钟判停摆（task 每 1 分钟跑，留 10 倍余量）
   rescue-retention-days: ${INFLUX_RESCUE_RETENTION_DAYS:365}  # 停摆时把 raw retention 临时拉到这里止血
   backfill-max-hours: ${INFLUX_BACKFILL_MAX_HOURS:72}      # 恢复后自动补算的最大跨度，超过只补最近一段
+  # 落库攒批：write() 只入队，后台单线程每 flush-interval 或攒够 batch-size 条刷一次
+  write:
+    batch-size: ${INFLUX_WRITE_BATCH_SIZE:500}
+    flush-interval-ms: ${INFLUX_WRITE_FLUSH_MS:200}
+    queue-capacity: ${INFLUX_WRITE_QUEUE:20000}            # 有界，满了丢弃计数、不阻塞调用方
+    fail-threshold: ${INFLUX_WRITE_FAIL_THRESHOLD:3}       # 连续失败几批才整体降级（避开单次抖动）
+    # 单 tick 最多连发几批。吞吐天花板 = 本值 × batch-size × 1000 / flush-interval-ms
+    # 默认 8/500/200 → 20,000 点/秒，实测 17,866 已贴住，要扩容先调这里
+    max-batches-per-tick: ${INFLUX_WRITE_MAX_BATCHES:8}
+  # 降级内存缓冲的全局点数上限（跨设备求和）。≤0 表示不限，只用于调试
+  memory:
+    max-total-points: ${INFLUX_MEMORY_MAX_POINTS:300000}   # 约 20MB；超限按「最久没新数据」整台淘汰
 
 redis:
   host: ${REDIS_HOST:localhost}

@@ -97,6 +97,29 @@ public class InfluxService {
     @Value("${influx.write.fail-threshold:3}")
     private int writeFailThreshold = 3;
 
+    /**
+     * 单个 tick 最多连发几批。
+     *
+     * <p>它和 {@code batch-size}、{@code flush-interval-ms} 共同决定吞吐天花板：
+     * {@code maxBatchesPerTick * batchSize * 1000 / flushInterval}。默认 8 时是 20,000 点/秒，
+     * 基准实测 17,866 点/秒已经贴住——扩容时先调这个，别急着换数据库。</p>
+     */
+    @Value("${influx.write.max-batches-per-tick:8}")
+    private int writeMaxBatchesPerTick = InfluxBatchWriter.DEFAULT_MAX_BATCHES_PER_TICK;
+
+    /**
+     * 降级内存缓冲的<b>全局</b>点数上限（跨所有设备求和）。
+     *
+     * <p>为什么每设备有界还不够：{@code MAX_MEM_POINTS_PER_DEVICE=3000} 只管单台，
+     * 1000 台就是 300 万点、约 200~300MB；3000 台接近 1GB。堆现在配的是 {@code -Xmx4g}，
+     * 靠堆大撑住了，但那是运气不是设计——本项目已经因为「无界队列」吃过一次 OOM
+     * （线程池队列后来才改成 {@code ArrayBlockingQueue}），不能在同一个地方栽第二次。</p>
+     *
+     * <p>300,000 点约合 20MB，对 4G 堆是安全的；{@code <=0} 表示不限（只用于调试，生产别这么配）。</p>
+     */
+    @Value("${influx.memory.max-total-points:300000}")
+    private int maxMemoryTotalPoints = 300_000;
+
     /** 连续写入失败批次数；成功一批即归零 */
     private final java.util.concurrent.atomic.AtomicInteger consecutiveWriteFailures =
             new java.util.concurrent.atomic.AtomicInteger(0);
@@ -122,6 +145,33 @@ public class InfluxService {
     /** 内存降级存储：device -> 该设备原始采样点（有界，防止长跑 OOM） */
     private static final int MAX_MEM_POINTS_PER_DEVICE = 3000;
     private final ConcurrentHashMap<String, List<Rec>> memRaw = new ConcurrentHashMap<>();
+
+    /**
+     * 降级缓冲里的<b>总点数</b>，与 {@link #memRaw} 同步维护。
+     *
+     * <p>两个作用：① 全局上限判定需要 O(1) 读数，不能每次都遍历所有设备求和
+     * （{@link #memoryPointCount()} 原来就是遍历求和，在 1000 台设备的降级态下
+     * 每次 health 上报都要扫 300 万个点）；② 让「淘汰了多少」和「还剩多少」用同一个账本，
+     * 不会出现「记着丢了 500，汇总却说 0 待补写」这种自相矛盾的观测。</p>
+     *
+     * <p><b>维护规矩：任何增删 memRaw 元素的地方都必须同步加减这个计数。</b>
+     * 漏一处就会永久漂移——偏大导致后续淘汰越来越激进，偏小则让上限失效。</p>
+     */
+    private final java.util.concurrent.atomic.AtomicInteger memoryPoints =
+            new java.util.concurrent.atomic.AtomicInteger();
+
+    /**
+     * 每台设备最近一次写入降级缓冲的序号，用于超全局上限时挑「最久没有新数据」的设备整台淘汰。
+     *
+     * <p>用单调自增序号而不是 {@code currentTimeMillis()}：降级瞬间同一毫秒内会涌入大量点，
+     * 时间戳排序不稳定，挑出来的「最旧设备」可能是随机的。</p>
+     */
+    private final ConcurrentHashMap<String, Long> devStashSeq = new ConcurrentHashMap<>();
+    private final java.util.concurrent.atomic.AtomicLong stashSeq =
+            new java.util.concurrent.atomic.AtomicLong();
+    /** 全局淘汰的互斥锁；只在已超上限时才进入，稳态零竞争 */
+    private final Object trimLock = new Object();
+
     /** 内存降级：1 分钟降采样缓存 device|field -> 按分钟聚合的点（查询时按窗口聚合，不落盘，基本不增长） */
     private final ConcurrentHashMap<String, List<Rec>> memDs = new ConcurrentHashMap<>();
 
@@ -214,7 +264,7 @@ public class InfluxService {
             // 攒批线程只在初始化成功后拉起：连不上 Influx 时它没有意义，
             // 而且此时写必然失败，只会把队列灌满再丢掉
             batchWriter = new InfluxBatchWriter(writeQueueCapacity, writeBatchSize,
-                    writeFlushIntervalMs, this::sinkWriteBatch);
+                    writeFlushIntervalMs, writeMaxBatchesPerTick, this::sinkWriteBatch);
             influxAvailable = true;
             log.info("InfluxDB 初始化完成: raw={}, downsample={}；落库攒批 batchSize={} flushInterval={}ms",
                     rawBucket, dsBucket, writeBatchSize, writeFlushIntervalMs);
@@ -333,44 +383,101 @@ public class InfluxService {
         }
     }
 
-    /** 包可见重载：便于单测直接验证补写逻辑，不必起真实 InfluxDB */
+    /**
+     * 包可见重载：便于单测直接验证补写逻辑，不必起真实 InfluxDB。
+     *
+     * <p><b>顺序是「先发完、再清」，不是「边清边发」。</b>上一版是每台设备的点装进 batch 后就
+     * 立刻把它从容器里删掉，但最后不满一批的那部分要等循环结束才发——那段一旦失败，
+     * 数据在内存里已经没了，补写也没救回来。测试里构造「第一批成功、第二批失败」
+     * 就能把这个丢失稳定复现出来：6000 点写回失败后容器里一个点都不剩。</p>
+     *
+     * <p>现在改成用 {@code sent} 指针记录<b>已确认写出的点数</b>，只有成功返回才推进；
+     * 最后按 {@code sent} 精确回退各设备的容器头部。失败时未发出的那部分原地保留，
+     * 下一轮 tick 继续重试。</p>
+     */
     int flushMemoryBacklog(WriteApiBlocking api) {
         if (api == null || memRaw.isEmpty()) {
             return 0;
         }
-        int total = 0;
-        List<Point> batch = new ArrayList<>(WRITE_BATCH_SIZE);
+        // 1. 拍快照。按设备顺序拼一条连续的待写序列，同时记下每台设备的边界，
+        //    这样「已写到第几个点」才能换算回「每台设备该清掉几个」。
+        List<String> devices = new ArrayList<>(memRaw.size());
+        List<List<Rec>> snapshots = new ArrayList<>(memRaw.size());
+        List<Rec> all = new ArrayList<>();
         for (Map.Entry<String, List<Rec>> entry : memRaw.entrySet()) {
             List<Rec> src = entry.getValue();
             List<Rec> snapshot;
             synchronized (src) {
                 snapshot = new ArrayList<>(src);
             }
-            for (Rec r : snapshot) {
-                batch.add(Point.measurement("telemetry")
-                        .addTag("device", r.device)
-                        .addField(r.field, r.value)
-                        .time(Instant.ofEpochMilli(r.ts), WritePrecision.MS));
-                if (batch.size() >= WRITE_BATCH_SIZE) {
-                    api.writePoints(rawBucket, org, batch);
-                    total += batch.size();
-                    batch.clear();
+            devices.add(entry.getKey());
+            snapshots.add(snapshot);
+            all.addAll(snapshot);
+        }
+
+        // 2. 逐批写。writePoints 抛异常时 sent 不推进，已写成功的部分仍然算数
+        int sent = 0;
+        try {
+            while (sent < all.size()) {
+                int end = Math.min(sent + WRITE_BATCH_SIZE, all.size());
+                List<Point> batch = new ArrayList<>(end - sent);
+                for (int i = sent; i < end; i++) {
+                    Rec r = all.get(i);
+                    batch.add(Point.measurement("telemetry")
+                            .addTag("device", r.device)
+                            .addField(r.field, r.value)
+                            .time(Instant.ofEpochMilli(r.ts), WritePrecision.MS));
+                }
+                api.writePoints(rawBucket, org, batch);
+                sent = end;
+            }
+        } finally {
+            // 放在 finally：中途失败也要把「已经写成功的那部分」从内存里清掉并记账，
+            // 否则这批点会被下一轮重复补写——虽然同 measurement+tag+time 是覆盖写、
+            // 不会脏数据，但会让 memoryPointCount 一直虚高，进而误判超限。
+            sent = evictWritten(devices, snapshots, sent);
+        }
+        return sent;
+    }
+
+    /**
+     * 按「已确认写出的点数」从各设备容器头部精确回退，并同步全局计数。
+     *
+     * @return 原样返回 {@code sent}，便于在 finally 里链式使用
+     */
+    private int evictWritten(List<String> devices, List<List<Rec>> snapshots, int sent) {
+        int offset = 0;
+        for (int k = 0; k < devices.size(); k++) {
+            int snapSize = snapshots.get(k).size();
+            int writable = Math.min(snapSize, Math.max(0, sent - offset));
+            offset += snapSize;
+            if (writable <= 0) {
+                continue;
+            }
+            List<Rec> src = memRaw.get(devices.get(k));
+            if (src == null) {
+                continue;
+            }
+            synchronized (src) {
+                int n = Math.min(writable, src.size());
+                src.subList(0, n).clear();
+                // 必须同步减全局计数：漏了的话降级补写越成功、账本反而越偏大，
+                // 最后会出现「内存里一个点都没了，却判定超限、把刚进来的数据全淘汰掉」
+                if (n > 0) {
+                    memoryPoints.addAndGet(-n);
                 }
             }
-            // 只删除已写回的部分，保留快照之后新进来的点
-            synchronized (src) {
-                int n = Math.min(snapshot.size(), src.size());
-                src.subList(0, n).clear();
-            }
             if (src.isEmpty()) {
-                memRaw.remove(entry.getKey(), src);
+                memRaw.remove(devices.get(k), src);
+                devStashSeq.remove(devices.get(k));
             }
         }
-        if (!batch.isEmpty()) {
-            api.writePoints(rawBucket, org, batch);
-            total += batch.size();
+        // 全部补写完 = 降级缓冲清零，账本一并归零（同样的并发纠偏）
+        if (memRaw.isEmpty()) {
+            memoryPoints.set(0);
+            devStashSeq.clear();
         }
-        return total;
+        return sent;
     }
 
     private void enterDegraded(String reason) {
@@ -450,6 +557,7 @@ public class InfluxService {
         m.put("mode", w == null ? "sync" : "batched");
         m.put("batchSize", writeBatchSize);
         m.put("flushIntervalMs", writeFlushIntervalMs);
+        m.put("maxBatchesPerTick", writeMaxBatchesPerTick);
         if (w != null) {
             m.put("accepted", w.acceptedCount());
             m.put("written", w.writtenCount());
@@ -457,18 +565,32 @@ public class InfluxService {
             // 队列满而丢：写入速度跟不上上报速度（Influx 变慢或攒批线程被拖住）
             m.put("droppedQueueFull", w.droppedCount());
             m.put("failedBatches", w.failedBatches());
+            // 吞吐天花板 = maxBatchesPerTick * batchSize * 1000 / flushInterval。
+            // 报出来是为了让「扩容该调哪个参数」可读，而不是翻代码去算
+            m.put("throughputCeilingPerSec", Math.round(w.theoreticalCeilingPerSec(writeFlushIntervalMs)));
         }
         m.put("rejectedByServer", rejectedPoints.get());
         m.put("invalidFieldsSkipped", invalidFields.get());
         m.put("evictedFromMemory", evictedCounter.get());
         m.put("memoryPendingPoints", memoryPointCount());
+        m.put("memoryLimitPoints", maxMemoryTotalPoints);
         m.put("consecutiveFailures", consecutiveWriteFailures.get());
         m.put("degradeThreshold", writeFailThreshold);
         return m;
     }
 
-    /** 内存降级缓冲里现有的点数（health 与单测共用） */
+    /**
+     * 内存降级缓冲里现有的点数（health 与单测共用）。
+     *
+     * <p>改成读 O(1) 计数而不是遍历求和：降级态下设备多、点数多，而 health 是高频调用的
+     * 观测接口，为了一次上报去扫几百万个点并不值得。</p>
+     */
     public int memoryPointCount() {
+        return Math.max(0, memoryPoints.get());
+    }
+
+    /** 遍历实际容器求和。只给单测用来交叉验证计数账本是否漂移，生产路径不调用 */
+    int memoryPointCountByScan() {
         int n = 0;
         for (List<Rec> l : memRaw.values()) {
             synchronized (l) {
@@ -476,6 +598,21 @@ public class InfluxService {
             }
         }
         return n;
+    }
+
+    /**
+     * 降级缓冲里还剩多少台设备。只给单测用。
+     *
+     * <p>它的用途是区分「整台淘汰」和「逐点淘汰」：两者减少的点数可能一样，
+     * 但设备数一个会降一个不会。没有这个读数，就没法证明淘汰策略真的是整台的。</p>
+     */
+    int memoryDeviceCountForTest() {
+        return memRaw.size();
+    }
+
+    /** 包可见：覆盖全局上限，供单测构造超限场景（不需要造 30 万个点） */
+    void setMaxMemoryTotalPointsForTest(int limit) {
+        this.maxMemoryTotalPoints = limit;
     }
 
     // ===================== 单测钩子 =====================
@@ -968,25 +1105,94 @@ public class InfluxService {
         return valid == 0 ? null : point;
     }
 
-    /** 落进内存降级缓冲（每设备有界淘汰）；写入失败与整体降级共用这一条路 */
+    /**
+     * 落进内存降级缓冲。三级有界：字段级剔除非法值 → 每设备上限 → 全局总量上限。
+     *
+     * <p>前两级原来就有，第三级是补的。补它的理由：每设备 3000 点乘上设备数就是总量，
+     * 而设备数是外部输入——设备增多、或者接入层被灌入伪造 deviceId 时，总量无界。
+     * 「每个分片都有界，合起来无界」是分布式系统里最常见的 OOM 形态之一。</p>
+     */
     private void stashToMemory(Telemetry t) {
         if (t == null || t.getMetrics() == null) {
             return;
         }
         List<Rec> list = memRaw.computeIfAbsent(t.getDeviceId(), k -> Collections.synchronizedList(new ArrayList<>()));
+        int added = 0;
         for (Map.Entry<String, Double> e : t.getMetrics().entrySet()) {
             if (e.getValue() == null || !Double.isFinite(e.getValue())) {
                 continue;
             }
             list.add(new Rec(t.getDeviceId(), t.getTs(), e.getKey(), e.getValue()));
+            added++;
         }
-        // 有界淘汰：仅保留每设备最近 MAX_MEM_POINTS_PER_DEVICE 个点，避免 1000 设备长跑时无限堆积导致 OOM
+        if (added == 0) {
+            return;
+        }
+        memoryPoints.addAndGet(added);
+        devStashSeq.put(t.getDeviceId(), stashSeq.incrementAndGet());
+
+        // 第二级：有界淘汰，仅保留每设备最近 MAX_MEM_POINTS_PER_DEVICE 个点
         synchronized (list) {
             int over = list.size() - MAX_MEM_POINTS_PER_DEVICE;
             if (over > 0) {
                 list.subList(0, over).clear();
                 // 记下来：这些点已经永久丢失，补写也救不回，必须让查询端知道这段不可信
                 evictedCounter.addAndGet(over);
+                memoryPoints.addAndGet(-over);
+            }
+        }
+        // 第三级：全局总量上限
+        trimMemoryToGlobalLimit();
+    }
+
+    /**
+     * 全局超限时按「最久没有新数据的设备」整台淘汰。
+     *
+     * <p><b>为什么整台淘汰而不是逐点淘汰。</b>逐点淘汰会让<b>每台设备</b>的曲线都缺中间一段，
+     * 查询端既不能判断哪段可信、也没法画连续曲线；整台淘汰至少保证活下来的设备序列是完整的，
+     * 丢掉的设备则是「整段没有」——后者对查询端是明确的状态，前者是隐藏的坏数据。</p>
+     *
+     * <p>选「最久没新数据」而不是「点数最多的」：前者通常意味着设备已经掉线或不活跃，
+     * 它的数据本来就快要过期了；后者会优先干掉数据密度高的设备，那往往是主力设备。</p>
+     */
+    private void trimMemoryToGlobalLimit() {
+        int limit = maxMemoryTotalPoints;
+        if (limit <= 0 || memoryPoints.get() <= limit) {
+            return;   // 快路径：稳态下就这一次整数比较
+        }
+        synchronized (trimLock) {
+            int over = memoryPoints.get() - limit;
+            if (over <= 0) {
+                return;   // 另一个线程已经腾出空间了
+            }
+            // 按写入序号升序 = 最久没有新数据的排在前面
+            List<String> victims = new ArrayList<>(devStashSeq.keySet());
+            victims.sort(java.util.Comparator.comparingLong(d -> devStashSeq.getOrDefault(d, Long.MAX_VALUE)));
+            for (String device : victims) {
+                if (over <= 0) {
+                    break;
+                }
+                List<Rec> victim = memRaw.remove(device);
+                devStashSeq.remove(device);
+                if (victim == null) {
+                    continue;
+                }
+                int n;
+                synchronized (victim) {
+                    n = victim.size();
+                    victim.clear();
+                }
+                if (n > 0) {
+                    over -= n;
+                    evictedCounter.addAndGet(n);
+                    memoryPoints.addAndGet(-n);
+                }
+            }
+            // 兜底纠偏：并发下 memoryPoints 可能与实际略有出入（例如 stash 到了已被移除的 list 上），
+            // 一旦发现实际已空就把账本归零，避免「明明没数据却一直判超限 → 每次都触发淘汰」的空转
+            if (memRaw.isEmpty()) {
+                memoryPoints.set(0);
+                devStashSeq.clear();
             }
         }
     }

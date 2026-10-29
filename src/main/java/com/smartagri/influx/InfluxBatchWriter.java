@@ -48,16 +48,22 @@ class InfluxBatchWriter {
     private static final Logger log = LoggerFactory.getLogger(InfluxBatchWriter.class);
 
     /**
-     * 一个刷新周期最多连发几批。
-     * 队列积压时只发一批会永远追不上（每 200ms 走一趟，每趟只吐 500 条，一积压就再也刷不完），
-     * 所以要能在单个周期内连续排空；同时留上界，避免一次 tick 长时间占住写锁。
+     * 一个刷新周期最多连发几批的默认值。
+     *
+     * <p>队列积压时只发一批会永远追不上（每 200ms 走一趟，每趟只吐 500 条，一积压就再也刷不完），
+     * 所以要能在单个周期内连续排空；同时留上界，避免一次 tick 长时间占住写锁。</p>
+     *
+     * <p><b>它同时就是吞吐天花板：{@code maxBatchesPerTick * batchSize / flushInterval}。</b>
+     * 默认值下是 8 × 500 ÷ 200ms = 20,000 点/秒，基准实测 17,866 点/秒已经贴住它——
+     * 也就是说扩容时真正的瓶颈是这个常量，不是 InfluxDB。所以它被做成了可配置项。</p>
      */
-    private static final int MAX_BATCHES_PER_TICK = 8;
+    static final int DEFAULT_MAX_BATCHES_PER_TICK = 8;
 
     private final BlockingQueue<Telemetry> queue;
     private final ScheduledExecutorService flusher;
     private final Sink sink;
     private final int batchSize;
+    private final int maxBatchesPerTick;
 
     private final AtomicLong accepted = new AtomicLong();
     private final AtomicLong dropped = new AtomicLong();
@@ -66,8 +72,20 @@ class InfluxBatchWriter {
     private volatile boolean running = false;
 
     InfluxBatchWriter(int capacity, int batchSize, long flushIntervalMs, Sink sink) {
+        this(capacity, batchSize, flushIntervalMs, DEFAULT_MAX_BATCHES_PER_TICK, sink);
+    }
+
+    /**
+     * @param maxBatchesPerTick 单个 tick 最多连发几批；它和 batchSize、flushIntervalMs 一起
+     *                          决定了吞吐天花板 {@code maxBatchesPerTick * batchSize / flushInterval}。
+     *                          小于 1 会被收敛为 1——否则 {@link #drainAndWrite()} 的循环一次都不会进，
+     *                          攒批线程就静默停摆了。
+     */
+    InfluxBatchWriter(int capacity, int batchSize, long flushIntervalMs,
+                      int maxBatchesPerTick, Sink sink) {
         this.queue = new ArrayBlockingQueue<>(Math.max(1, capacity));
         this.batchSize = Math.max(1, batchSize);
+        this.maxBatchesPerTick = Math.max(1, maxBatchesPerTick);
         this.sink = sink;
         this.flusher = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "influx-batch-writer");
@@ -99,7 +117,7 @@ class InfluxBatchWriter {
 
     private void drainAndWrite() {
         try {
-            for (int i = 0; i < MAX_BATCHES_PER_TICK && !queue.isEmpty(); i++) {
+            for (int i = 0; i < maxBatchesPerTick && !queue.isEmpty(); i++) {
                 List<Telemetry> batch = new ArrayList<>(batchSize);
                 queue.drainTo(batch, batchSize);
                 if (batch.isEmpty()) {
@@ -173,5 +191,20 @@ class InfluxBatchWriter {
 
     int pending() {
         return queue.size();
+    }
+
+    int maxBatchesPerTick() {
+        return maxBatchesPerTick;
+    }
+
+    /**
+     * 理论吞吐天花板（点/秒）= {@code maxBatchesPerTick * batchSize / flushInterval}。
+     *
+     * <p>暴露它是为了让「扩容该调哪个参数」变成一个可读数，而不是靠翻代码去算。
+     * 注意这是<b>上限</b>，不是实测能力——实测值受服务端单次写入耗时约束，见 README 6.1。</p>
+     */
+    double theoreticalCeilingPerSec(long flushIntervalMs) {
+        long interval = Math.max(1L, flushIntervalMs);
+        return (double) maxBatchesPerTick * batchSize * 1000.0 / interval;
     }
 }
