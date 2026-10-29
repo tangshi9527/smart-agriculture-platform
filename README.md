@@ -1,163 +1,428 @@
 # 智慧农业云管端一体化平台
 
-个人练习项目：用 Java 写一个 MQTT 设备接入 → 时序存储 → 告警判定 → 实时推送的完整链路，配一个 Vue 3 大屏。
+> 个人练习项目。一台开发机上写完并跑起来的完整链路：MQTT 设备接入 → 时序存储 → 降采样 → 告警判定 → WebSocket 大屏推送。
+> **没有生产部署，没有真实硬件接入。** InfluxDB / RabbitMQ / MySQL 只有代码和单元测试，没起过真实服务 —— 详见「[八、已知限制](#八已知限制)」。
+>
+> 文中标 `[待填：…]` 的地方是还没定的命令 / 路径 / 地址，清单见文末。
 
-> **先说边界**：这是在一台开发机上写完并跑起来的练习项目。**没有生产部署，没有真实硬件接入**。
-> InfluxDB / RabbitMQ / MySQL 只有代码和单元测试，没有实际起过服务。
-> 哪些验过、哪些没验过，见「[能力边界](#能力边界)」。
+---
 
-## 架构
+## 一、项目用途
 
-```mermaid
-flowchart TB
-    SIM["Python 模拟器<br/>零依赖 · 手写 MQTT 报文"]
+给农业大棚做设备接入和数据看板：传感器经 MQTT 上报温湿度、光照、土壤数据，平台解析后更新设备影子、写时序库、按规则判告警，再推给大屏。
 
-    subgraph L1["接入层"]
-        MQTT["Netty · MQTT 3.1.1<br/>9 种报文 · 设备鉴权 · topic ACL · 帧长上限"]
-    end
-
-    subgraph L2["平台层"]
-        INGEST["接入网关<br/>数值清洗 · 设备影子"]
-        BUS["遥测事件总线<br/>进程内 / RabbitMQ"]
-        STORE["存储消费者"]
-        ALERT["告警消费者<br/>规则热加载"]
-        PUSH["推送消费者"]
-        AI["AI 解读（可选）<br/>无 Key 走本地模板"]
-        API["REST API<br/>JWT · 限流 · 幂等 · 熔断"]
-    end
-
-    subgraph L3["存储与展示"]
-        IFX[("InfluxDB<br/>raw + 1min 降采样")]
-        DB[("H2 / MySQL")]
-        UI["Vue 3 大屏<br/>ECharts"]
-    end
-
-    SIM -->|"MQTT 1883"| MQTT
-    MQTT --> INGEST
-    INGEST --> BUS
-    BUS --> STORE --> IFX
-    BUS --> ALERT --> DB
-    ALERT --> AI
-    BUS --> PUSH -->|"WebSocket"| UI
-    UI -->|"REST"| API
-    API --> DB
-    API --> IFX
-```
-
-## 技术栈
+**用途定位**：技术验证 + 作品集，不是可交付生产的系统。
 
 | 层 | 技术 |
 |---|---|
-| 后端 | Spring Boot 3.2 / Java 21 |
-| 设备接入 | Netty 4.1，自己写的 MQTT 3.1.1 编解码（没用现成 broker） |
+| 后端 | Spring Boot 3.2.5 / Java 21 |
+| 设备接入 | Netty 4.1，自研 MQTT 3.1.1 编解码（不接现成 broker） |
 | 时序存储 | InfluxDB 2.x，Flux Task 做 1 分钟均值降采样 |
-| 缓存 | Redis 存设备影子；无 Redis 时降级进程内 Map |
-| 消息 | 进程内总线 / RabbitMQ，由 `mq.enabled` 切换，业务代码不改 |
-| 安全 | Spring Security + JWT；设备侧是「设备 ID + 密钥」 |
-| 容错 | resilience4j 熔断、令牌桶限流、幂等回执、降级可恢复 |
+| 关系库 | H2（默认）/ MySQL（只有 profile 和驱动） |
+| 缓存 | Redis 存设备影子，无 Redis 时降级进程内 Map |
+| 消息 | 进程内总线 / RabbitMQ，由 `mq.enabled` 切换 |
+| 安全 | Spring Security + JWT；设备侧「设备 ID + 密钥」 |
+| 容错 | resilience4j 熔断、令牌桶限流、幂等回执、可恢复降级 |
 | 前端 | Vue 3 + Vite + Element Plus + ECharts |
 
-## 主要功能
+数据流一行：`模拟器 → MQTT(1883) → 清洗 + 影子 → 事件总线 → {存储 → 攒批 → InfluxDB | 告警 → H2 | 推送 → WebSocket} → 大屏`
 
-1. **MQTT 接入层** — Netty 手写 9 种报文编解码、长连接管理、心跳保活。设备鉴权用 username/password，校验失败返回 CONNACK(4)；topic 级 ACL 限制设备只能读写自己名下的主题；单帧长度有上限，避免设备侧发超大包把服务端内存打满。
-2. **时序存储与降采样** — 遥测写 InfluxDB 原始库，Flux Task 每分钟算一次均值写入降采样库，长周期查询改读降采样层。InfluxDB 不可用时降级到内存缓冲，恢复后补写并记录空洞区间。
-3. **告警引擎** — 规则存库并热加载到内存，支持「条件持续 N 秒才触发」；触发后写记录，条件恢复自动置 RESOLVED。改规则不用重启。
-4. **实时推送** — WebSocket 把遥测、告警、连接状态广播给所有在线大屏。
-5. **AI 告警解读** — 告警触发后调大模型生成「可能原因 / 影响 / 处置建议 / 是否需人工」，结果流式推给前端。有独立线程池、同规则 60 秒节流、熔断三道保护；没配 API Key 时走本地模板并明确标记为未调用模型，不把兜底包装成 AI 输出。
+---
 
-## 快速开始
+## 二、安装步骤
+
+**前置依赖**
+
+| 依赖 | 版本要求 | 是否必需 |
+|---|---|---|
+| JDK | 21（`pom.xml` 里 `java.version=21`） | 必需 |
+| Node.js | 18+（Vite 5 的要求） | 只做前端时必需 |
+| Python | 3.x，仅用标准库 | 跑模拟器时必需 |
+| Maven | 不需要，仓库自带 wrapper（`mvnw` / `mvnw.cmd`） | — |
+| Docker | 任意较新版本 | 可选，只用于一键拉起依赖 |
+
+**步骤**
+
+1. 获取代码
 
 ```bash
-git clone https://github.com/tangshi9527/smart-agriculture-platform.git
+git clone [待填：仓库地址]
 cd smart-agriculture-platform
-
-# 后端（无需本机装 Maven，用 wrapper）
-./mvnw spring-boot:run          # HTTP 8080，MQTT 1883
-
-# 前端
-cd frontend && npm install && npm run dev
 ```
 
-不配任何环境变量也能启动——`application.yml` 里所有凭据都是 `${ENV:演示默认值}`。
-要改就 `cp .env.example .env`。想一次起全部依赖（InfluxDB + Redis + RabbitMQ + MySQL）：
-`docker compose up -d`。
+2. 装后端依赖并编译（首次会下载依赖，比较慢）
 
-主要接口（除登录外都需要 `Authorization: Bearer <token>`）：
+```bash
+./mvnw -q -DskipTests package      # Windows: mvnw.cmd -q -DskipTests package
+```
 
-| 接口 | 说明 |
-|---|---|
-| `POST /api/auth/login` | 登录拿 JWT |
-| `GET /api/system/health` | 健康状态（降级原因、队列积压、脏数据计数都在这里） |
-| `GET /api/telemetry/{deviceId}?range=-1h` | 遥测查询，支持原始库 / 降采样库 |
-| `GET /api/telemetry/benchmark` | 两种查询路径的耗时对比 |
-| `GET/POST /api/alerts/rules` | 告警规则查询与保存 |
-| `POST /api/ai/explain` | 手动触发一条告警的 AI 解读 |
-| `POST /api/simulator/start` | 拉起 Python 模拟器 |
+3. 装前端依赖
 
-## 能力边界
+```bash
+cd frontend && npm install && cd ..
+```
 
-### 验过的
+4. 环境变量（可选，不配也能跑）
 
-| 项 | 结果 |
-|---|---|
-| MQTT 接入规模 | 本机 loopback 模拟器，1000 连接 / 500 设备同时在线 |
-| WebSocket 吞吐 | 单客户端约 573 条/秒（自写 WS 客户端计数） |
-| Redis 设备影子 | 本机真实 Redis 实例，读写正常 |
-| 告警热更新 | 新增规则后立即生效，无需重启 |
-| 单元测试 | 23 个测试类 / 83 个用例，`./mvnw test` 全绿 |
+```bash
+cp .env.example .env
+```
 
-### 没验过的
+`application.yml` 里所有凭据都是 `${环境变量:演示默认值}` 形式，不配就走演示值。`.env` 已被 `.gitignore` 忽略。
 
-| 项 | 说明 |
-|---|---|
-| **InfluxDB 真实读写与降采样** | 全程走内存降级路径。写入、Flux Task 创建、retention、补算逻辑只在单元测试和 mock 上验证过，**Flux 脚本没在真实实例上执行过** |
-| **RabbitMQ** | 只有 `rabbitmq-mock` 内存版集成测试，没连过真 broker |
-| **MySQL** | 配了 profile，没实际跑过，全程用 H2 |
-| **真实硬件** | 没有。所有「设备」都是 Python 脚本在 loopback 上模拟 |
-| **压测与长时间稳定性** | 没有压测报告。1000 连接是功能验证规模，不是性能结论；也没有 24 小时以上的长跑数据 |
-| **生产部署** | 没有 |
+5. 验证安装是否到位
 
-1000 连接这个数字证明了 Netty 能同时持有 1000 个 TCP 连接并正确处理报文，没在连接数上出现明显瓶颈；
-但它**不证明**真实网络下的接入能力——全在 loopback，没有 RTT、丢包重传、NAT 超时、弱网重连。
+```bash
+./mvnw test                        # 27 个测试类 / 96 个用例，应全绿
+```
 
-## 已知限制
+---
+
+## 三、运行方式
+
+### 方式 A：本地零依赖（默认，最省事）
+
+不需要装任何外部服务，H2 存关系数据、进程内总线传消息、InfluxDB 不可用时走内存降级。
+
+```bash
+# 后端：HTTP 8080，MQTT 1883
+./mvnw spring-boot:run             # Windows: mvnw.cmd spring-boot:run
+
+# 或走脚本（带 JVM 参数，见下方说明）
+scripts/start-backend.sh           # Windows: scripts\start-backend.bat
+```
+
+```bash
+# 前端（另开一个终端）
+scripts/start-frontend.sh          # Windows: scripts\start-frontend.bat
+# 等价于：cd frontend && npm install && npm run dev
+```
+
+### 方式 B：Docker Compose（一次拉起全部依赖）
+
+```bash
+cp .env.example .env               # compose 会读它
+docker compose up -d
+```
+
+compose 里的服务：`influxdb`、`redis`、`rabbitmq`、`mysql`、`app`、`frontend`。
+`app` 依赖前四个的 healthcheck 通过后才启动。
+
+### 方式 C：跑已打包的 jar
+
+```bash
+# 必须带 JVM 参数，原因见「七、常见问题」第 7 条
+java -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -Xms512m -Xmx4g \
+     -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=./heapdump.hprof \
+     -jar target/smart-agriculture-platform.jar
+```
+
+`scripts/run-backend.bat` 就是这条命令，不想手敲可以直接跑它。
+
+### 端口与地址
+
+| 用途 | 默认端口 | 说明 |
+|---|---|---|
+| 后端 HTTP | 8080 | `SERVER_PORT` 可改 |
+| MQTT | 1883 | `MQTT_PORT` 可改 |
+| 前端开发服务器 | 5173 | `frontend/vite.config.js` 里写死 |
+| 前端（compose / nginx） | 80 | 反代到 `app:8080` |
+| InfluxDB | 8086 | compose 内 |
+| 数据库文件 | `./data/agri.mv.db` | `DB_PATH` 可改 |
+
+部署后的访问地址：`[待填：线上地址]`
+服务器部署目录：`[待填：部署路径]`
+
+---
+
+## 四、使用示例
+
+下面 `$BASE` 指后端地址，本地默认 `http://localhost:8080`，线上填 `[待填：线上地址]`。
+
+**1. 登录拿 JWT**
+
+启动时 `DataInitializer` 会建一个默认账户 `admin / admin123`，并预置 `device-00001` ~ `device-00010` 十个示例设备密钥。
+
+```bash
+curl -X POST "$BASE/auth/login" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin123"}'
+```
+
+除 `/auth/**`、`/ws/**`、`/actuator/**`、`/simulator/**`、`/h2-console/**` 外，其余接口都要带 `Authorization: Bearer <token>`。
+
+**2. 查健康状态**
+
+降级原因、队列积压、脏数据计数都在这里，排查先看它。
+
+```bash
+curl "$BASE/api/system/health" -H "Authorization: Bearer $TOKEN"
+```
+
+**3. 起设备模拟器**
+
+```bash
+# 独立跑（默认 200 设备 / 200 连接）
+python simulator/device_sim.py
+
+# 或走脚本
+scripts/run-sim.bat
+
+# 调规模（1000 连接属于压测档，注意机器温度）
+python simulator/device_sim.py --connections 1000 --connect-pace-ms 5
+```
+
+也可以让后端拉起，注意路径是 `/simulator`，**不是** `/api/simulator`：
+
+```bash
+curl -X POST "$BASE/simulator/start" -H "Content-Type: application/json" -d '{}'
+curl "$BASE/simulator/status"
+curl -X POST "$BASE/simulator/stop"
+```
+
+**4. 查遥测数据**
+
+```bash
+curl "$BASE/api/telemetry/device-00001?range=-1h" -H "Authorization: Bearer $TOKEN"
+```
+
+**5. 打开大屏**
+
+浏览器访问 `[待填：前端访问地址]`（本地开发是 `http://localhost:5173`）。
+实时数据走 WebSocket `/ws/dashboard`，前端通过 `VITE_API_BASE` 指定后端地址。
+
+**主要接口一览**（路径以代码为准）
+
+| 接口 | 方法 | 说明 |
+|---|---|---|
+| `/auth/login` `/auth/register` | POST | 登录 / 注册 |
+| `/api/system/health` | GET | 健康状态与降级信息 |
+| `/api/telemetry/{deviceId}?range=-1h` | GET | 遥测查询，可选原始库 / 降采样库 |
+| `/api/alerts` | GET/POST | 告警规则查询与保存 |
+| `/api/devices` | GET | 设备与密钥管理 |
+| `/api/dashboard` | GET | 大屏汇总数据 |
+| `/simulator/start` `/stop` `/status` | POST/GET | 模拟器编排 |
+| `/ws/dashboard` | WS | 遥测 / 告警 / 连接状态推送 |
+| `/h2-console` | — | H2 控制台（仅开发） |
+| `/actuator/health` `/actuator/prometheus` | GET | 指标暴露 |
+
+---
+
+## 五、关键配置说明
+
+**总原则**：`application.yml` 里全部是 `${环境变量:演示默认值}`。不配任何变量也能启动；要改就复制 `.env.example` 为 `.env`，**不要直接改 yml**。演示默认值只能用于本地。
+
+**必看的几项**
+
+| 变量 | 默认 | 改错会怎样 |
+|---|---|---|
+| `SERVER_PORT` | 8080 | 和前端 `VITE_API_BASE` 对不上就连不通 |
+| `DB_PATH` | `./data/agri` | 相对**启动目录**，不是项目根；换目录启动会建一个新的空库 |
+| `INFLUX_URL` / `INFLUX_TOKEN` / `INFLUX_ORG` / `INFLUX_BUCKET` | 见 `.env.example` | org / bucket 与 compose 初始化值不一致时，**连得上但写不进** |
+| `INFLUX_TASK_HEALTH_MS` | 300000（5 分钟） | 降采样 Task 是 InfluxDB 自己的调度对象，停摆时应用完全无感，这个探测是唯一信号 |
+| `INFLUX_TASK_LAG_MS` | 600000（10 分钟） | Task 每 1 分钟跑一次，这里留了 10 倍余量；调小会误判停摆 |
+| `INFLUX_RESCUE_RETENTION_DAYS` | 365 | 判停摆后临时拉长的 raw 保留期，**补算成功才调回**，防止修复期间原始数据被过期删掉 |
+| `MQ_ENABLED` | false | true 时才连 RabbitMQ；`false` 走进程内总线，业务代码不用改 |
+| `JWT_SECRET` | 演示串 | HS256 要求 ≥32 字节，生产必须换。生成：`openssl rand -base64 48` |
+| `MQTT_SIM_USERNAME` / `MQTT_SIM_SECRET` | 见 `.env.example` | 模拟器专用服务账号，脚本和后端共用，两边不一致会 CONNACK 失败 |
+| `LLM_ENABLED` / `LLM_API_KEY` | false / 空 | 任一不满足就不发任何外部请求，自动降级本地模板，大屏标注 `LOCAL` |
+| `API_LEGACY_COMPAT` | true | true 时 `/api/**` 与 `/api/v1/**` 同时可用，下线旧版改 false |
+| `CAPACITY_CPU_THRESHOLD` / `CAPACITY_HEAP_THRESHOLD` | 0.7 / 0.8 | 资源紧张时只给「降采样率」节流建议，**不会自动切内存存储** |
+
+**两个 retention 要一起看**
+
+`INFLUX_RAW_RETENTION_DAYS`（默认 30）和 `INFLUX_DOWNSAMPLE_RETENTION_DAYS`（默认 365）只在**建库时**生效，改已有 bucket 得走 update API。
+调小之前先想清楚：降采样 task 停摆 + raw 到期 = 数据永久丢且**没有任何报错**。
+
+**前端**
+
+后端地址由 `VITE_API_BASE` 指定，默认 `http://localhost:8080`（在 `frontend/src/api.js` 里）。
+`vite.config.js` 没配 proxy，所以开发时是跨域直连；compose 部署走 nginx 反代，不需要这个变量。
+
+---
+
+## 六、关键设计取舍
+
+> 这一章只回答「为什么这么做」，操作步骤在上面几章。
+> 每条都写清**被否决的方案和理由**——只列结论的方案清单没有信息量，被砍掉的那些才有。
+
+### 6.1 写入用攒批，不是一条一个 HTTP
+
+`WriteApiBlocking` 是同步阻塞的：一条遥测一次 HTTP 往返。200 设备、每 2 秒一报是 100 次/秒，
+storage 链路的线程全部时间花在等网络上——**加线程没用，瓶颈在往返次数不在线程数**。
+
+现在 `write()` 只把 `Telemetry` 丢进有界队列就返回，后台单线程每 200ms 或攒够 500 条刷一次。
+**实测：100 设备 / 200ms 间隔跑一轮，9210 个点只产生 113 次写请求（平均 81 点/次，最大 136）。**
+
+**否决的方案**：换 `WriteApi`（非阻塞、内部缓冲）——它自己也定时 flush，但缓冲无界，
+且写失败后数据去向不由我们控制；而这个项目需要「写失败 → 转内存 → 恢复后补写」这条闭环
+掌握在自己手里。另一个被否决的是加 storage 线程数：IO 密集时加线程只是把更多请求压到
+同一个 InfluxDB 上。
+
+### 6.2 写失败要分类，不能一律降级
+
+上一版是 `catch (Exception e) → influxAvailable = false`，把两种完全不同的失败当成一种：
+
+| 失败类型 | 上一版 | 现在 |
+|---|---|---|
+| 网络超时 / 5xx | 立即降级 | **连续 3 批**才降级，前两批数据转内存等补写 |
+| HTTP 400（字段类型冲突、行协议语法错） | 立即降级，而且**永久**降级 | 丢弃该批 + 计数，**不降级** |
+
+400 那条才是真事故：重试永远是 400，于是系统永久留在内存模式，正常数据也开始往内存堆，
+最终又是 OOM。**修一个故障顺手引入另一个故障，就是这么来的。**
+
+现在的判断依据：4xx 里除 408（超时）和 429（限流）外，重试结果都一样，只能丢。
+被丢弃的点数在 `/api/system/health` 的 `influx.write.rejectedByServer`，
+和「队列满丢弃」「非法字段剔除」「内存淘汰」分开计数——**四个数指向四种完全不同的排查方向**，
+合成一个 `dropped` 等于没数。
+
+### 6.3 在线集合是 ZSET，不是 SET
+
+「谁超时了」用 SET 只能 `SMEMBERS` 拿全量再逐台 `HGET lastHeartbeat`：1000 台设备
+就是每秒 1 + 1000 次 Redis 往返。本机 loopback 撑得住，真实网络 RTT 1ms 时这个扫描
+根本追不上心跳——**等于用自己的往返延迟去对抗心跳间隔**。
+
+改成 ZSET（score = 心跳毫秒时间戳）之后，判定压成一次
+`ZRANGEBYSCORE agri:online 0 (now-10s)`，正常情况返回空集、零额外开销。
+
+顺带修掉一个更危险的隐患：上一版 `Long.parseLong(hb)` 和 Redis 操作共用同一个 try，
+心跳字段被写坏就抛 `NumberFormatException`，被 `catch (Exception)` 当成「Redis 挂了」——
+**一台设备的脏字段把全部设备的状态切进内存影子**。
+
+**升级注意**：旧版本这个 key 是 SET 类型，直接升级会拿到 `WRONGTYPE`。代码里特判了：
+删键重建（在线名单是可再生数据，下次心跳会写回来），不降级。
+
+### 6.4 队列有界 + 满了直接丢，不用 CallerRunsPolicy
+
+提交方是 Netty 的 IO 线程。`CallerRunsPolicy` 会让它自己跑存储写入，
+等于一个 EventLoop 上几百条连接一起卡住。**丢点只影响一条数据，阻塞影响一片连接。**
+
+### 6.5 用进程内总线，不是上来就 RabbitMQ
+
+`mq.enabled` 默认 false。抽 `TelemetryMessageBus` 接口是为了 clone 下来零外部依赖就能跑，
+生产要真解耦时改一行配置切到 `RabbitMqTelemetryBus`。两条路都保留，但
+**只有本地总线跑过端到端**，RabbitMQ 只有 `rabbitmq-mock` 内存 broker 的集成测试。
+
+### 6.6 三条链路各自一个队列，不共用
+
+三个消费者的丢点容忍度完全不同：storage 是尽力持久化，alert 丢一条就是漏一次告警，
+push 丢一条下一条会补。共用队列时，storage 被 InfluxDB 拖慢会把 alert 和 push 一起挤掉——
+用户看到的是「曲线在、告警没了、大屏卡了」，**三个症状一个根因**。而且告警延迟从 50ms
+悄悄变成 500ms，根本没人发现。
+
+### 6.7 降采样必须自己探活，因为 Task 停摆没有任何信号
+
+Flux Task 写的是 `range(start: -task.every)`，只算最近一分钟，所以**任务停了那一段就永久
+缺失，不会自己回补**。而 Task 是 InfluxDB 内部的调度对象，停摆时应用侧收不到任何通知；
+30 天后 raw retention 把没被降采样的数据删掉——数据永久丢失，且没有任何报错。
+
+所以每 5 分钟比一次两个桶的最新点时间。判停摆后先把 raw retention 从 30 天临时拉到 365 天
+（**不是为了修复，是为了防止修复期间原始数据被过期删掉**），再按 1 小时分片跑 Flux 补算，
+补算成功才调回配置值。**空洞能补，蒸发补不回来。**
+
+### 6.8 手写 MQTT 变长长度字段，不用 LengthFieldBasedFrameDecoder
+
+那个解码器能用，但 MQTT 的剩余长度是变长编码（1~4 字节，每字节 7 位有效），
+配参数绕而且不容易自证。自己写反而直白：读变长长度 → 算总长 → 可读字节不够就 return
+（半包留在累积缓冲，下次接着解）。
+
+### 6.9 限流在外、幂等在内
+
+先挡超频再判重复。反过来的话，有人恶意刷接口会先把幂等 key 写满 Redis。
+
+### 6.10 降级必须能恢复，否则是单向门
+
+Redis 抖一次就永久用内存影子，多实例各算各的、重启全丢。所以降级后每 30s 探一次
+（指数退避到 300s），恢复时**先把内存状态回写再切回**，否则降级期间的读数在切回瞬间丢失。
+
+Influx 同理，但多一道门槛：资源守卫说 CPU 还紧张就不恢复。因为 ping 通只说明服务活着，
+不代表本机扛得住一次批量写——直接切回的结果是「切回 → 写入打满 CPU → 判失败 → 又降级」，
+每 30 秒一次尖峰，比一直用内存更折腾。
+
+## 七、常见问题
+
+**1. 没装 InfluxDB / Redis，能启动吗？**
+能。InfluxDB 连不上会降级到进程内内存缓冲（恢复后补写并记录空洞区间），Redis 连不上影子降级到进程内 Map。降级原因在 `/api/system/health` 里能看到。
+
+**2. 为什么不用 RabbitMQ 也能跑？**
+`mq.enabled` 默认 false，走 `LocalTelemetryBus`（进程内线程池）。抽这一层是为了 clone 下来零外部依赖，生产要真解耦时改一行配置切到 `RabbitMqTelemetryBus`。
+
+**3. 数据库文件在哪？重启会不会丢？**
+默认 `./data/agri.mv.db`（`DB_PATH` 是前缀，相对启动目录）。文件型 H2 会持久化，`ddl-auto: update` 自动建表。删掉这个文件等于清库。
+
+**4. 改了 retention 为什么不生效？**
+只在**建库时**生效。已有 bucket 要用 InfluxDB 的 bucket update API 改，或删库重建。
+
+**5. 怎么知道降采样任务是不是停了？**
+靠 `INFLUX_TASK_HEALTH_MS` 定时探活：比对原始库和降采样库各自最新点的时间差，超过 `INFLUX_TASK_LAG_MS` 判停摆。判停后先放宽 raw 保留期止血，再按小时分片补算，补算成功才复原保留期。
+之所以要自己探，是因为 Task 是 InfluxDB 内部的调度对象，它停了应用侧完全收不到任何通知。
+
+**6. 前端页面空白 / 请求全部失败？**
+先看 `VITE_API_BASE` 和后端端口对不对。`vite.config.js` 没有 proxy，前端是直连后端的，跨域和后端地址错误都会表现成「请求全挂」。再看后端 `/api/system/health` 是否正常。
+
+**7. 跑一会儿内存吃满、CPU 风扇狂转甚至过热关机？**
+别用裸 `java -jar`。`scripts/` 下的启动脚本带了 `-XX:+UseG1GC -XX:MaxGCPauseMillis=200 -Xms512m -Xmx4g`，这是踩过这个坑之后加的：早期堆只有 1G 且时序缓冲无界，OOM 后 Full GC 反复触发把核心全占了。手动启动也要带这组参数。
+
+**8. 模拟器把机器跑爆？**
+默认是 200 设备 / 200 连接（稳定档）。`--connections 1000` 属于压测档，要显式加，并且关注机器温度——`scripts/run-sim.bat` 的注释里也写了这一点。
+
+**9. 打包时提示找不到符号 / Lombok 注解不生效？**
+`pom.xml` 里 Lombok 配了 `annotationProcessorPaths`，用 `mvnw` 走标准流程没问题；如果用 IDE 编译，需要开启 annotation processing。
+
+---
+
+## 八、已知限制
 
 | 项 | 现状 |
 |---|---|
-| MQTT QoS 2 / 离线消息 / 会话持久化 | 只实现了 QoS 0/1 报文层 |
-| TLS | MQTT 明文 1883，未配证书 |
+| MQTT QoS 2 / 离线消息 / 会话持久化 | 只实现到 QoS 0/1 的报文层；QoS 2 只解析了标志位，没做 PUBREC 那套握手；遗嘱消息（Will）未做 |
+| TLS | MQTT 明文 1883，没配证书 |
 | 设备密钥存储 | 比较用了恒定时间实现，但库里仍是明文 |
 | 单实例 | 长连接路由表在进程内存里，多节点无法跨节点下发指令 |
-| 告警消除通知 | 记录状态能自动置 RESOLVED，但没有「告警已消除」的推送 |
+| 告警消除通知 | 记录能自动置 RESOLVED，但没有「告警已消除」的推送 |
 | 测试覆盖率 | 未接 JaCoCo，真实覆盖率未知 |
+| 前端 | 没配 Vite proxy，开发态是跨域直连 |
+| 落库攒批的延迟 | 一批最多等 200ms 才落库。告警判定不经过 InfluxDB，所以不影响告警时效；但如果要拿 InfluxDB 当准实时数据源，这 200ms 是硬延迟 |
+| 攒批参数没做容量推算 | `batchSize=500` / `queue=20000` 是经验值。真要算得先量单条行协议大小和 InfluxDB 单次写入的 P99 |
+| 攒批只在假服务上验证过 | 81 点/次、9210 点 113 次请求这组数是在 `scripts/mock-influx-batch-test.py` 上量的，**不是真实 InfluxDB 的写入吞吐** |
+| Redis 在线集合的升级 | 旧版本 `agri:online` 是 SET，升级后第一次写入会报 `WRONGTYPE`，代码会删键重建。重建瞬间在线数归零，下一次心跳恢复 |
 
-## 目录结构
+**验过的 / 没验过的**
 
-```
-src/main/java/com/smartagri/
-├── mqtt/        Netty MQTT 编解码 + 长连接管理
-├── ingest/      接入网关（数值清洗 + 设备影子）
-├── mq/          遥测事件总线 + 三个消费者（存储 / 告警 / 推送）
-├── influx/      InfluxDB 写入、查询、降采样、降级恢复
-├── alert/       告警引擎 + 规则 + 记录
-├── device/      遥测模型、设备影子、设备密钥
-├── gateway/     API 治理（版本化 / 限流 / 幂等 / 熔断 / 指标）
-├── ai/          大模型告警解读
-├── auth/        JWT 认证
-├── websocket/   实时推送
-├── simulator/   模拟器编排（拉起 Python 脚本）
-└── controller/  REST 接口
-frontend/        Vue 3 大屏
-simulator/       device_sim.py（零依赖 Python 模拟器）
-scripts/         启动与验证脚本
-```
+| 项 | 结论 |
+|---|---|
+| MQTT 接入规模 | 本机 loopback 模拟，1000 连接 / 500 设备同时在线 —— **功能验证规模，不是性能结论** |
+| WebSocket 吞吐 | 单客户端约 573 条/秒（自写 WS 客户端计数） |
+| Redis 设备影子 | 本机真实 Redis 实例，读写正常 |
+| 告警热更新 | 新增规则立即生效，无需重启 |
+| 单元测试 | 27 个测试类 / 96 个用例，`./mvnw test` 全绿 |
+| **InfluxDB 真实读写与降采样** | 全程走内存降级路径。写入、Flux Task 创建、retention、补算只在单元测试和 mock 上验证过，**Flux 脚本没在真实实例上执行过** |
+| **RabbitMQ** | 只有 `rabbitmq-mock` 内存版集成测试，没连过真 broker |
+| **MySQL** | 配了 profile 和驱动，没实际跑过，全程用 H2 |
+| **真实硬件** | 没有。所有「设备」都是 `simulator/device_sim.py` 在 loopback 上模拟 |
+| **写入攒批** | 用 `scripts/mock-influx-batch-test.py`（最小 InfluxDB v2 假服务）验证过批次合并、4xx 不降级、5xx 连续 3 批降级、恢复后补写 8200 点；**没在真实 InfluxDB 上量过吞吐** |
+| **压测与长时间稳定性** | 没有压测报告，也没有 24 小时以上长跑数据 |
+| **生产部署** | 没有 |
 
-规模：105 个主代码类 / 约 8300 行，23 个测试类 / 83 个用例。
-CI（`.github/workflows/ci.yml`）跑后端测试 + 打包、前端构建。
+1000 连接这个数字只证明 Netty 能同时持有 1000 个 TCP 连接并正确解析报文，没在连接数上出现明显瓶颈；
+它**不证明**真实网络下的接入能力 —— 全在 loopback，没有 RTT、丢包重传、NAT 超时、弱网重连。
+
+---
+
+## 附：待补清单
+
+按出现顺序列出。补完后本节整段删掉，再全局搜 `待填` 应无结果：
+
+1. 二、安装步骤 — `git clone [待填：仓库地址]`
+2. 三、运行方式 — 部署后的访问地址 `[待填：线上地址]`
+3. 三、运行方式 — 服务器部署目录 `[待填：部署路径]`
+4. 四、使用示例 — `$BASE` 的线上取值 `[待填：线上地址]`
+5. 四、使用示例 — 大屏访问地址 `[待填：前端访问地址]`
+
+---
 
 ## 许可证
 
 [MIT](LICENSE) © 2026 tangshi9527
 
-可以自由使用、修改、分发，包括商业用途，保留版权声明即可。
-软件按「现状」提供，不附带任何形式的担保。
+可自由使用、修改、分发（含商业用途），保留版权声明即可。软件按「现状」提供，不附带任何形式的担保。
