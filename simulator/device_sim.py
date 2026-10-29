@@ -314,7 +314,7 @@ class Greenhouse:
     全部用「平衡值 + 时间常数」的指数松弛，dt 任意大都不发散。
     """
 
-    def __init__(self, cfg, rng, zone_idx=0, init_soil=None):
+    def __init__(self, cfg, rng, zone_idx=0, init_soil=None, zone_seed=None):
         g = cfg["gh"]
         self.cfg = cfg
         self.rng = rng
@@ -322,10 +322,23 @@ class Greenhouse:
         self.a_floor = g["a_floor"]
         self.vol = g["a_floor"] * g["height"]
 
-        # 棚间差异：朝向/覆盖/密封性的个体差（±8%），让多棚数据有可信差别
+        # ---- 棚间差异 ----
+        # 一律作用在「物理参数」上，绝不给真值加随机偏移。否则棚间差异和传感器
+        # 个体差会混在同一条噪声里，事后无法区分「两个棚真的不同」还是「探头没校准」。
+        # 三个参数各对应一种真实差异来源：
+        #   tau_scale   透光率   ← 朝向/屋脊走向导致的太阳入射角差异
+        #   k_cover_sc  覆盖层换热系数×面积 ← 保温被/双层膜/老化程度
+        #   infil_scale 换气次数 ← 密封性（缝隙、门开合频次）
         jitter = 1.0 + 0.08 * (rng.random() * 2 - 1)
         self.k_cover_scale = jitter
         self.infil_scale = 1.0 + 0.15 * (rng.random() * 2 - 1)
+
+        # 透光率用**独立派生 RNG**：与 Weather 共享的那个 rng 一旦多消耗一次，
+        # Weather.step 的第一步随机数就整体移位，既有实测基线（告警命中率等）全部作废。
+        # 派生方式确定、不依赖调用顺序，同 seed 可复现。
+        zseed = (zone_seed if zone_seed is not None else zone_idx)
+        zrng = random.Random(zseed * 2654435761 + 17)
+        self.tau_scale = 1.0 + 0.06 * (zrng.random() * 2 - 1)
 
         # 状态量
         self.t_in = 26.0
@@ -370,7 +383,7 @@ class Greenhouse:
         self.u = u
 
         # ---- 入射光 ----
-        ppfd_in = w["ppfd_out"] * g["tau_cover"] * (1.0 - g["shade_max"])
+        ppfd_in = w["ppfd_out"] * g["tau_cover"] * self.tau_scale * (1.0 - g["shade_max"])
         ppfd_in += u["lamp"] * g["ppfd_lamp"]
         i_in = ppfd_in / PPFD_PER_WM2
 
@@ -1063,7 +1076,7 @@ class SimFarm:
         for z in range(nz):
             rng = random.Random(seed * 1000 + z)
             w = Weather(cfg, rng, hour0=cfg["sim"]["start_hour"] + z * 0.3)
-            gh = Greenhouse(cfg, rng, zone_idx=z, init_soil=init_soil)
+            gh = Greenhouse(cfg, rng, zone_idx=z, init_soil=init_soil, zone_seed=seed * 1000 + z)
             arb = ActuatorArbiter(cfg)
             self.zones.append(dict(weather=w, gh=gh, arb=arb,
                                    sensors=None, faults=None))
@@ -1260,6 +1273,11 @@ def report_dry_run(cfg, farm, devs, hours, steps):
     for t_th, h_th in ((24.0, 60.0), (28.0, 60.0), (30.0, 65.0), (30.0, 80.0)):
         nh = sum(1 for a, b in zip(tt, hh) if a > t_th and b > h_th)
         print("      T>%4.1f 且 RH>%4.1f : %6.2f%%" % (t_th, h_th, 100.0 * nh / n))
+    print("      注：t>24 低于本仿真的通风设定点 26℃，所以「控制器正常工作」即命中该条，")
+    print("          它不是异常判据。边界敏感性见 simulator/boundary_sweep.py。")
+    print("      注：soilMoisture<25 的阈值低于灌溉触发点 0.27，正常控制下不会触发；")
+    print("          此处命中来自初始含水率（--init-soil）。作物耗水约 1.1 个百分点/天，")
+    print("          24 小时窗口验不出过程，该规则本质是多日慢变量判据。")
 
     # 昼夜
     if "_hour" in f0[0]:
